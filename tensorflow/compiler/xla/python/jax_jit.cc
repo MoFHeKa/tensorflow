@@ -46,6 +46,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/python/py_buffer.h"
 #include "tensorflow/compiler/xla/python/py_executable.h"
 #include "tensorflow/compiler/xla/python/py_values.h"
+#include "tensorflow/compiler/xla/python/python_ref_manager.h"
 #include "tensorflow/compiler/xla/python/pytree.h"
 #include "tensorflow/compiler/xla/python/types.h"
 #include "tensorflow/compiler/xla/shape_util.h"
@@ -76,9 +77,10 @@ std::string ArgSignature::DebugString() const {
 
 bool CallSignature::operator==(const CallSignature& other) const {
   return std::tie(dynamic_positional_args_treedef, keyword_args,
-                  dynamic_args_signatures, device) ==
+                  dynamic_args_signatures, device, jax_enable_x64) ==
              std::tie(other.dynamic_positional_args_treedef, other.keyword_args,
-                      other.dynamic_args_signatures, other.device) &&
+                      other.dynamic_args_signatures, other.device,
+                      other.jax_enable_x64) &&
          // `==` on py:objects is the Python `is`. We need equal.
          std::equal(
              static_args.begin(), static_args.end(), other.static_args.begin(),
@@ -95,7 +97,8 @@ bool CallSignature::operator==(const CallSignature& other) const {
                      py::cast<std::string>(py::str(py::type::of(b))),
                      ". The error was:\n", e.what()));
                }
-             });
+             }) &&
+         extra_jit_context.equal(other.extra_jit_context);
 }
 
 void CallSignature::IncRef() const {
@@ -112,53 +115,54 @@ void CallSignature::DecRef() const {
 
 namespace {
 
-// These 2 constants are protected by the GIL.
-ABSL_CONST_INIT bool disable_jit_flag = false;
-ABSL_CONST_INIT bool enable_x64_flag = false;
+// Flags, such as JIT disable and the x64 mode, are controlled by:
+// - a global flag value, e.g., associated to --jax_enable_x64
+// - possibly a thread-local value, which initially is absl::nullopt and
+//   overrides the global value if set. The thread-local state is
+//   used to implement context managers that locally override the global state.
+// TODO(phawkins): consider changing the global state to optional types to
+// catch cases where we fail to set it.
+struct GlobalJitState {
+  bool disable_jit = false;
+  bool enable_x64 = false;
+  py::object extra_jit_context = py::none();
+};
 
-ABSL_CONST_INIT thread_local absl::optional<bool> disable_jit_thread_local =
-    absl::nullopt;
-ABSL_CONST_INIT thread_local absl::optional<bool> jax_enable_x64_thread_local =
-    absl::nullopt;
+// Protected by the GIL.
+GlobalJitState& global_state = *new GlobalJitState();
 
-// The x64 mode is controlled by:
-// - a global flag value, associated to --jax_enable_x64
-// - possibly a thread-local value, which initially is absl::nullopt and which
-//   will default to the flag value as long as it's not set.
-void SetEnableX64Flag(bool jax_enable_x64) { enable_x64_flag = jax_enable_x64; }
-bool GetEnableX64Flag() { return enable_x64_flag; }
-void SetEnableX64ThreadLocal(absl::optional<bool> jax_enable_x64) {
-  jax_enable_x64_thread_local = jax_enable_x64;
-}
-absl::optional<bool> GetEnableX64ThreadLocal() {
-  return jax_enable_x64_thread_local;
-}
+struct ThreadLocalJitState {
+  ~ThreadLocalJitState() {
+    if (extra_jit_context) {
+      // We likely do not hold the GIL, so we hand the Python object to the
+      // global reference manager to destroy.
+      py::object o = std::move(*extra_jit_context);
+      xla::GlobalPyRefManager()->AddGarbage(absl::MakeSpan(&o, 1));
+      extra_jit_context = absl::nullopt;
+    }
+  }
+  absl::optional<bool> disable_jit;
+  absl::optional<bool> enable_x64;
+  absl::optional<py::object> extra_jit_context;
+};
 
-void SetDisableJitFlag(bool disable_jit) { disable_jit_flag = disable_jit; }
-bool GetDisableJitFlag() { return disable_jit_flag; }
-void SetDisableJitThreadLocal(absl::optional<bool> disable_jit) {
-  disable_jit_thread_local = disable_jit;
-}
-absl::optional<bool> GetDisableJitThreadLocal() {
-  return disable_jit_thread_local;
-}
+// TODO(phawkins): Google style guide forbids thread-local values with
+// non-trivial destructors.
+ABSL_CONST_INIT thread_local ThreadLocalJitState thread_local_state;  // NOLINT
 
 bool JitIsDisabled() {
-  if (disable_jit_thread_local != absl::nullopt) {
-    return disable_jit_thread_local.value();
-  } else {
-    return disable_jit_flag;
-  }
+  return thread_local_state.disable_jit.value_or(global_state.disable_jit);
+}
+
+py::object ExtraJitContext() {
+  return thread_local_state.extra_jit_context.value_or(
+      global_state.extra_jit_context);
 }
 
 }  // namespace
 
 bool GetEnableX64() {
-  if (jax_enable_x64_thread_local != absl::nullopt) {
-    return jax_enable_x64_thread_local.value();
-  } else {
-    return enable_x64_flag;
-  }
+  return thread_local_state.enable_x64.value_or(global_state.enable_x64);
 }
 
 std::string CallSignature::DebugString() const {
@@ -207,6 +211,7 @@ H AbslHashValue(H h, const CallSignature& s) {
   h = H::combine_contiguous(std::move(h), s.dynamic_args_signatures.data(),
                             s.dynamic_args_signatures.size());
   h = H::combine(std::move(h), s.device);
+  h = H::combine(std::move(h), s.jax_enable_x64);
   for (const auto& static_arg : s.static_args) {
     ssize_t hash;
     try {
@@ -221,6 +226,7 @@ H AbslHashValue(H h, const CallSignature& s) {
     }
     h = H::combine(std::move(h), hash);
   }
+  h = H::combine(std::move(h), py::hash(s.extra_jit_context));
   return h;
 }
 
@@ -531,6 +537,7 @@ class CompiledFunction {
   }
 
   int cache_size() const { return executables_.size(); }
+  void ClearCache() { executables_.clear(); }
 
  private:
   // Returns nullptr if not present in the cache.
@@ -845,6 +852,7 @@ xla::StatusOr<py::object> CompiledFunction::Call(py::args args,
            .ok()) {
     return py::object(py::cast<py::tuple>(cache_miss_(*args, **kwargs))[0]);
   }
+  arguments.signature.extra_jit_context = ExtraJitContext();
 
   CacheEntry* cache_entry = GetCacheEntryIfPresent(arguments.signature);
 
@@ -908,20 +916,62 @@ void BuildJaxjitSubmodule(pybind11::module& m) {
   cfun.def_property_readonly("__signature__",
                              &CompiledFunction::PythonSignature);
 
-  jitlib.def("set_disable_jit_cpp_flag", &SetDisableJitFlag);
-  jitlib.def("get_disable_jit_cpp_flag", &GetDisableJitFlag);
-  jitlib.def("set_disable_jit_thread_local", &SetDisableJitThreadLocal);
-  jitlib.def("get_disable_jit_thread_local", &GetDisableJitThreadLocal);
-  jitlib.def("jit_is_disabled", &JitIsDisabled);
-  // TODO(jblespiau): Remove from the Python code and remove this
-  jitlib.def("set_disable_jit", &SetDisableJitThreadLocal);
-  jitlib.def("get_disable_jit", &GetDisableJitThreadLocal);
+  py::class_<GlobalJitState> global_state_(jitlib, "GlobalJitState");
+  global_state_.def_readwrite("disable_jit", &GlobalJitState::disable_jit);
+  global_state_.def_readwrite("enable_x64", &GlobalJitState::enable_x64);
+  global_state_.def_readwrite("extra_jit_context",
+                              &GlobalJitState::extra_jit_context);
 
-  jitlib.def("set_enable_x64_cpp_flag", &SetEnableX64Flag);
-  jitlib.def("get_enable_x64_cpp_flag", &GetEnableX64Flag);
-  jitlib.def("set_enable_x64_thread_local", &SetEnableX64ThreadLocal);
-  jitlib.def("get_enable_x64_thread_local", &GetEnableX64ThreadLocal);
+  py::class_<ThreadLocalJitState> thread_local_state_(jitlib,
+                                                      "ThreadLocalJitState");
+  thread_local_state_.def_readwrite("disable_jit",
+                                    &ThreadLocalJitState::disable_jit);
+  thread_local_state_.def_readwrite("enable_x64",
+                                    &ThreadLocalJitState::enable_x64);
+  thread_local_state_.def_readwrite("extra_jit_context",
+                                    &ThreadLocalJitState::extra_jit_context);
+
+  jitlib.def(
+      "global_state", [&]() { return &global_state; },
+      py::return_value_policy::reference);
+  jitlib.def(
+      "thread_local_state", [&]() { return &thread_local_state; },
+      py::return_value_policy::reference);
+
+  jitlib.def("jit_is_disabled", &JitIsDisabled);
   jitlib.def("get_enable_x64", &GetEnableX64);
+
+  // TODO(phawkins): delete the following methods after dropping compatibility
+  // with JAX python versions older than 0.2.10.
+  jitlib.def("set_disable_jit_cpp_flag",
+             [&](bool disable_jit) { global_state.disable_jit = disable_jit; });
+  jitlib.def("get_disable_jit_cpp_flag",
+             [&]() { return global_state.disable_jit; });
+  jitlib.def("set_disable_jit_thread_local",
+             [&](absl::optional<bool> disable_jit) {
+               thread_local_state.disable_jit = disable_jit;
+             });
+  jitlib.def("get_disable_jit_thread_local",
+             [&]() { return thread_local_state.disable_jit; });
+  // TODO(jblespiau): Remove from the Python code and remove this
+  jitlib.def("set_disable_jit", [&](bool disable_jit) {
+    thread_local_state.disable_jit = disable_jit;
+  });
+  jitlib.def("get_disable_jit",
+             [&]() { return thread_local_state.disable_jit; });
+
+  jitlib.def("set_enable_x64_cpp_flag",
+             [&](bool enable_x64) { global_state.enable_x64 = enable_x64; });
+  jitlib.def("get_enable_x64_cpp_flag",
+             [&]() { return global_state.enable_x64; });
+  jitlib.def("set_enable_x64_thread_local",
+             [&](absl::optional<bool> enable_x64) {
+               thread_local_state.enable_x64 = enable_x64;
+             });
+  jitlib.def("get_enable_x64_thread_local", [&](bool enable_x64) {
+    thread_local_state.enable_x64 = enable_x64;
+  });
+  // TODO(phawkins): delete up to here.
 
   jitlib.def(
       "jit",
@@ -983,8 +1033,9 @@ void BuildJaxjitSubmodule(pybind11::module& m) {
       .def_readonly("weak_type", &ArgSignature::weak_type);
   jitlib.def("_ArgSignatureOfValue", &ArgSignatureOfValue);
 
-  // All private members are only for testing purposes
+  // All private members are only for testing/debugging purposes
   cfun.def("_cache_size", &CompiledFunction::cache_size);
+  cfun.def("_clear_cache", &CompiledFunction::ClearCache);
   jitlib.def("_is_float0", &IsFloat0);
 }
 
